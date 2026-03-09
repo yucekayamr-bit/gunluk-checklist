@@ -825,7 +825,7 @@ export default function App() {
   };
 
   // Visible tasks
-  const visibleTasks = tasks.filter(t=>{
+  const visibleTasks = tasks.map(t=>({...t, type: t.type||TYPE_ROUTINE})).filter(t=>{
     if(t.type===TYPE_ROUTINE) return true;
     if(t.type===TYPE_ONETIME) return t.date===selectedDate;
     if(t.type===TYPE_TIMED){ if(!t.deadline) return true; return t.deadline>=selectedDate||!checked[t.id]; }
