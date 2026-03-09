@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBbiuXhJyHnqZM-H_wrIGpnKarG8UKUU6s",
@@ -34,7 +34,6 @@ const randCode = () => Math.random().toString(36).slice(2, 7).toUpperCase();
 const MONTHS_TR = ["Ocak","Şubat","Mart","Nisan","Mayıs","Haziran","Temmuz","Ağustos","Eylül","Ekim","Kasım","Aralık"];
 const DAYS_TR = ["Pt","Sa","Ça","Pe","Cu","Ct","Pz"];
 const GROUP_COLORS = ["#f59e0b","#22c55e","#3b82f6","#a855f7","#ef4444","#06b6d4","#f97316","#84cc16"];
-
 const TYPE_ROUTINE = "routine";
 const TYPE_ONETIME = "onetime";
 const TYPE_TIMED   = "timed";
@@ -43,27 +42,405 @@ const TYPE_LABELS = {
   [TYPE_ONETIME]: { label:"Bugüne Özel", color:"#ea580c", bg:"#fff7ed", border:"#fed7aa" },
   [TYPE_TIMED]:   { label:"Süreli",      color:"#3b82f6", bg:"#eff6ff", border:"#93c5fd" },
 };
-
 const DEPOTS = [
-  { id: "merkez", label: "Merkez Depo", icon: "🏢" },
-  { id: "bahce",  label: "Bahçe Deposu", icon: "🌿" },
+  { id:"merkez", label:"Merkez Depo",   icon:"🏢" },
+  { id:"bahce",  label:"Bahçe Deposu",  icon:"🌿" },
 ];
-
 function getFirstDayOfMonth(y,m){let d=new Date(y,m,1).getDay();return d===0?6:d-1;}
 function getDaysInMonth(y,m){return new Date(y,m+1,0).getDate();}
+const fmtDate = (d) => new Date(d+"T00:00:00").toLocaleDateString("tr-TR",{weekday:"long",year:"numeric",month:"long",day:"numeric"});
+const dayStr  = (y,m,d) => `${y}-${String(m+1).padStart(2,"0")}-${String(d).padStart(2,"0")}`;
+const isToday = (y,m,d) => { const t=new Date(); return t.getFullYear()===y&&t.getMonth()===m&&t.getDate()===d; };
 
+// ─────────────────────────────────────────────
+//  STOCK TAB  (defined outside App to avoid re-mount on render)
+// ─────────────────────────────────────────────
+function StockTab({ roomCode, products, packageTypes, stock, stockAlerts, stockWarnings }) {
+  const [showAddProduct, setShowAddProduct] = useState(false);
+  const [productName, setProductName]       = useState("");
+  const [productNote, setProductNote]       = useState("");
+  const [expandedProduct, setExpandedProduct] = useState(null);
+  const [showAddPkg, setShowAddPkg]           = useState(null);
+  const [pkgLabel, setPkgLabel]               = useState("");
+  const [pkgKg, setPkgKg]                     = useState("");
+  const [pkgUnit, setPkgUnit]                 = useState("adet");
+
+  const rp = () => `rooms/${roomCode}`;
+  const db = () => getDB();
+
+  const addProduct = async () => {
+    const name = productName.trim(); if (!name) return;
+    const id = `p-${Date.now()}`;
+    await db().ref(`${rp()}/products/${id}`).set({ id, name, note: productNote.trim()||null, createdAt: Date.now() });
+    setProductName(""); setProductNote(""); setShowAddProduct(false); setExpandedProduct(id);
+  };
+
+  const deleteProduct = async (pid) => {
+    await db().ref(`${rp()}/products/${pid}`).remove();
+    const relPkgs = Object.values(packageTypes).filter(p=>p.productId===pid);
+    const batch = {};
+    relPkgs.forEach(p => {
+      batch[`${rp()}/packageTypes/${p.id}`] = null;
+      DEPOTS.forEach(d => { batch[`${rp()}/stock/${d.id}/${p.id}`]=null; batch[`${rp()}/stockAlerts/${p.id}/${d.id}`]=null; });
+    });
+    if (Object.keys(batch).length) await db().ref().update(batch);
+  };
+
+  const addPkg = async (productId) => {
+    const label = pkgLabel.trim(); if (!label) return;
+    const id = `pk-${Date.now()}`;
+    await db().ref(`${rp()}/packageTypes/${id}`).set({ id, productId, label, kg: pkgKg?parseFloat(pkgKg):null, unit: pkgUnit||"adet" });
+    const batch = {}; DEPOTS.forEach(d => { batch[`${rp()}/stock/${d.id}/${id}`]=0; });
+    await db().ref().update(batch);
+    setPkgLabel(""); setPkgKg(""); setPkgUnit("adet"); setShowAddPkg(null);
+  };
+
+  const deletePkg = async (pkgId) => {
+    await db().ref(`${rp()}/packageTypes/${pkgId}`).remove();
+    const batch = {}; DEPOTS.forEach(d => { batch[`${rp()}/stock/${d.id}/${pkgId}`]=null; batch[`${rp()}/stockAlerts/${pkgId}/${d.id}`]=null; });
+    await db().ref().update(batch);
+  };
+
+  const updateStock = async (depotId, pkgId, delta) => {
+    const current = (stock[depotId]?.[pkgId]) || 0;
+    await db().ref(`${rp()}/stock/${depotId}/${pkgId}`).set(Math.max(0, current + delta));
+  };
+
+  const setStockDirect = async (depotId, pkgId, val) => {
+    const n = parseInt(val); if (isNaN(n) || n < 0) return;
+    await db().ref(`${rp()}/stock/${depotId}/${pkgId}`).set(n);
+  };
+
+  const setAlert = async (pkgId, depotId, val) => {
+    const n = parseInt(val);
+    if (isNaN(n) || n < 0) { await db().ref(`${rp()}/stockAlerts/${pkgId}/${depotId}`).remove(); return; }
+    await db().ref(`${rp()}/stockAlerts/${pkgId}/${depotId}`).set(n);
+  };
+
+  const productList = Object.values(products).sort((a,b)=>a.createdAt-b.createdAt);
+
+  return (
+    <div>
+      {/* ── Warning banners ── */}
+      {stockWarnings.length > 0 && (
+        <div style={{marginBottom:16}}>
+          <div style={{fontSize:12,fontWeight:700,color:"#a07050",marginBottom:8,letterSpacing:"0.5px",textTransform:"uppercase"}}>🔔 Stok Uyarıları</div>
+          {stockWarnings.map((w,i) => (
+            <div key={i} style={{
+              padding:"10px 14px", borderRadius:10, border:"1.5px solid",
+              marginBottom:8, fontSize:13, lineHeight:1.6,
+              background: w.isBahce ? "#fff7ed" : "#fef2f2",
+              borderColor: w.isBahce ? "#fed7aa" : "#fecaca",
+              color: w.isBahce ? "#92400e" : "#991b1b",
+            }}>
+              <div style={{fontWeight:700,marginBottom:2}}>{w.isBahce ? "🌿 Bahçe Deposu Azaldı" : "🏢 Merkez Depo Azaldı"}</div>
+              <div>{w.productName} — {w.pkgLabel}: <strong>{w.current} {w.unit}</strong> kaldı (eşik: {w.min})</div>
+              <div style={{fontSize:11,marginTop:4,opacity:0.8}}>{w.isBahce ? "👉 Merkez depodan getirin" : "👉 Temin edilmesi gerekiyor"}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {stockWarnings.length === 0 && productList.length > 0 && (
+        <div style={{background:"#f0fdf4",border:"1px solid #86efac",borderRadius:10,padding:"10px 14px",marginBottom:16,fontSize:13,color:"#166534"}}>
+          ✅ Tüm stoklar yeterli seviyede
+        </div>
+      )}
+
+      {/* ── Product list ── */}
+      {productList.map(product => {
+        const pkgs = Object.values(packageTypes).filter(p=>p.productId===product.id);
+        const isExpanded = expandedProduct === product.id;
+        const productWarnings = stockWarnings.filter(w=>w.productId===product.id);
+
+        return (
+          <div key={product.id} style={{...s.productCard, border: productWarnings.length>0?"1.5px solid #fca5a5":"1px solid #f0e4cc"}}>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",cursor:"pointer"}} onClick={()=>setExpandedProduct(isExpanded?null:product.id)}>
+              <div style={{display:"flex",alignItems:"center",gap:8}}>
+                <span style={{fontWeight:700,fontSize:15,color:"#2d1f0e"}}>📦 {product.name}</span>
+                {product.note && <span style={{fontSize:11,color:"#a07050"}}>{product.note}</span>}
+                {productWarnings.length>0 && <span style={{fontSize:11,background:"#fef2f2",border:"1px solid #fecaca",color:"#ef4444",borderRadius:20,padding:"1px 8px",fontWeight:700}}>⚠️ {productWarnings.length} uyarı</span>}
+              </div>
+              <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                <button onClick={e=>{e.stopPropagation();deleteProduct(product.id);}} style={{...s.iconBtn,opacity:0.4}}>🗑️</button>
+                <span style={{color:"#a07050",fontSize:13}}>{isExpanded?"▼":"▶"}</span>
+              </div>
+            </div>
+
+            {isExpanded && (
+              <div style={{marginTop:14}}>
+                {pkgs.length > 0 && (
+                  <div style={{overflowX:"auto",marginBottom:14}}>
+                    <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
+                      <thead>
+                        <tr style={{background:"#f9f5ef"}}>
+                          <th style={s.th}>Paket</th>
+                          {DEPOTS.map(d=><th key={d.id} style={{...s.th,textAlign:"center"}}>{d.icon} {d.label}</th>)}
+                          <th style={{...s.th,textAlign:"center"}}>Uyarı Eşiği</th>
+                          <th style={s.th}></th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {pkgs.map(pkg => (
+                          <tr key={pkg.id} style={{borderBottom:"1px solid #f0e4cc"}}>
+                            <td style={{...s.td,fontWeight:600}}>
+                              {pkg.label}
+                              {pkg.kg && <span style={{fontSize:10,color:"#a07050",marginLeft:4}}>{pkg.kg}kg</span>}
+                            </td>
+                            {DEPOTS.map(depot => {
+                              const cnt = (stock[depot.id]?.[pkg.id]) || 0;
+                              const minAmt = stockAlerts[pkg.id]?.[depot.id];
+                              const isLow = minAmt !== undefined && cnt <= minAmt;
+                              return (
+                                <td key={depot.id} style={{...s.td,textAlign:"center"}}>
+                                  <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:4}}>
+                                    <button onClick={()=>updateStock(depot.id,pkg.id,-1)} style={s.stockBtn}>−</button>
+                                    <input
+                                      type="number" min="0"
+                                      value={cnt}
+                                      onChange={e=>setStockDirect(depot.id,pkg.id,e.target.value)}
+                                      style={{...s.stockInput, borderColor:isLow?"#ef4444":"#f0e4cc", color:isLow?"#ef4444":"#2d1f0e", fontWeight:isLow?700:400}}
+                                    />
+                                    <button onClick={()=>updateStock(depot.id,pkg.id,1)} style={s.stockBtn}>+</button>
+                                  </div>
+                                  {isLow && <div style={{fontSize:10,color:"#ef4444",marginTop:2}}>⚠️ düşük</div>}
+                                </td>
+                              );
+                            })}
+                            <td style={{...s.td,textAlign:"center"}}>
+                              <div style={{display:"flex",gap:6,justifyContent:"center",flexWrap:"wrap"}}>
+                                {DEPOTS.map(depot => (
+                                  <div key={depot.id} style={{display:"flex",alignItems:"center",gap:3}}>
+                                    <span style={{fontSize:10,color:"#a07050"}}>{depot.icon}≤</span>
+                                    <input
+                                      type="number" min="0" placeholder="—"
+                                      value={stockAlerts[pkg.id]?.[depot.id] ?? ""}
+                                      onChange={e=>setAlert(pkg.id,depot.id,e.target.value)}
+                                      style={s.alertInput}
+                                    />
+                                  </div>
+                                ))}
+                              </div>
+                            </td>
+                            <td style={s.td}>
+                              <button onClick={()=>deletePkg(pkg.id)} style={{...s.iconBtn,opacity:0.4,fontSize:11}}>🗑️</button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+
+                {showAddPkg === product.id ? (
+                  <div style={{background:"#f9f5ef",borderRadius:10,padding:12,marginBottom:8}}>
+                    <div style={{fontSize:12,fontWeight:600,color:"#a07050",marginBottom:8}}>Yeni Paket Tipi</div>
+                    <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:8}}>
+                      <input value={pkgLabel} onChange={e=>setPkgLabel(e.target.value)} placeholder='Etiket (örn: "15kg torba")' style={{...s.input,flex:2,fontSize:13,padding:"7px 10px"}}/>
+                      <input value={pkgKg} onChange={e=>setPkgKg(e.target.value)} placeholder="Kg" type="number" min="0" style={{...s.input,width:70,fontSize:13,padding:"7px 10px"}}/>
+                      <select value={pkgUnit} onChange={e=>setPkgUnit(e.target.value)} style={s.select}>
+                        <option>adet</option><option>torba</option><option>kutu</option><option>paket</option><option>kg</option>
+                      </select>
+                    </div>
+                    <div style={{display:"flex",gap:8}}>
+                      <button onClick={()=>addPkg(product.id)} style={{...s.btn,background:"#22c55e",padding:"7px 14px",fontSize:13}}>+ Ekle</button>
+                      <button onClick={()=>setShowAddPkg(null)} style={{...s.btn,background:"#e5e7eb",color:"#6b7280",padding:"7px 14px",fontSize:13}}>İptal</button>
+                    </div>
+                  </div>
+                ) : (
+                  <button onClick={()=>setShowAddPkg(product.id)} style={{...s.btn,background:"#f0fdf4",color:"#22c55e",border:"1.5px dashed #86efac",fontSize:12,padding:"6px 14px"}}>+ Paket Tipi Ekle</button>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })}
+
+      {/* ── Add product form ── */}
+      {showAddProduct ? (
+        <div style={{...s.productCard,background:"#f9f5ef"}}>
+          <div style={{fontSize:13,fontWeight:600,color:"#a07050",marginBottom:10}}>Yeni Ürün</div>
+          <input
+            value={productName}
+            onChange={e=>setProductName(e.target.value)}
+            onKeyDown={e=>e.key==="Enter"&&addProduct()}
+            placeholder="Ürün adı (örn: Kuru Mama)"
+            style={{...s.input,marginBottom:8,fontSize:14}}
+          />
+          <input
+            value={productNote}
+            onChange={e=>setProductNote(e.target.value)}
+            placeholder="Not (opsiyonel)"
+            style={{...s.input,marginBottom:12,fontSize:13}}
+          />
+          <div style={{display:"flex",gap:8}}>
+            <button onClick={addProduct} style={{...s.btn,background:"#22c55e"}}>+ Ekle</button>
+            <button onClick={()=>{setShowAddProduct(false);setProductName("");setProductNote("");}} style={{...s.btn,background:"#e5e7eb",color:"#6b7280"}}>İptal</button>
+          </div>
+        </div>
+      ) : (
+        <button onClick={()=>setShowAddProduct(true)} style={{...s.btn,background:"#f0fdf4",color:"#22c55e",border:"1.5px dashed #86efac",width:"100%",marginTop:4}}>
+          + Yeni Ürün Ekle
+        </button>
+      )}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────
+//  CALENDAR TAB
+// ─────────────────────────────────────────────
+function CalendarTab({ tasks, issues, checked, stockWarnings }) {
+  const today = new Date();
+  const [calYear, setCalYear]   = useState(today.getFullYear());
+  const [calMonth, setCalMonth] = useState(today.getMonth());
+  const [calFilter, setCalFilter] = useState("all");
+  const [detailDay, setDetailDay] = useState(null);
+
+  const issueDates    = Object.values(issues).map(i=>i.reportedAt).filter(Boolean);
+  const deadlineDates = tasks.filter(t=>t.type===TYPE_TIMED&&t.deadline).map(t=>t.deadline);
+
+  const dim = getDaysInMonth(calYear,calMonth);
+  const fd  = getFirstDayOfMonth(calYear,calMonth);
+  const cells = [...Array(fd).fill(null), ...Array.from({length:dim},(_,i)=>i+1)];
+
+  const detailIssues    = detailDay ? Object.entries(issues).filter(([,v])=>v.reportedAt===detailDay) : [];
+  const detailDeadlines = detailDay ? tasks.filter(t=>t.deadline===detailDay&&t.type===TYPE_TIMED) : [];
+  const detailWarnings  = detailDay===todayStr() ? stockWarnings : [];
+
+  return (
+    <div>
+      {/* Filter chips */}
+      <div style={{display:"flex",gap:6,marginBottom:14,flexWrap:"wrap"}}>
+        {[
+          {key:"all",       label:"Tümü",         color:"#6b7280"},
+          {key:"issues",    label:"⚠️ Hatalar",    color:"#ef4444"},
+          {key:"warnings",  label:"🔔 Stok",       color:"#f59e0b"},
+          {key:"deadlines", label:"⏳ Deadlineler", color:"#3b82f6"},
+        ].map(f=>(
+          <button key={f.key} onClick={()=>setCalFilter(f.key)} style={{
+            padding:"5px 12px",borderRadius:20,border:"1.5px solid",fontSize:12,cursor:"pointer",fontFamily:"inherit",fontWeight:calFilter===f.key?700:400,
+            background:calFilter===f.key?"#2d1f0e":"#fff",
+            borderColor:calFilter===f.key?"#2d1f0e":f.color,
+            color:calFilter===f.key?"#fff":f.color,
+          }}>{f.label}</button>
+        ))}
+      </div>
+
+      {/* Month nav */}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14}}>
+        <button onClick={()=>{let m=calMonth-1,y=calYear;if(m<0){m=11;y--;}setCalMonth(m);setCalYear(y);}} style={s.calNav}>‹</button>
+        <span style={{fontWeight:700,fontSize:16,color:"#2d1f0e"}}>{MONTHS_TR[calMonth]} {calYear}</span>
+        <button onClick={()=>{let m=calMonth+1,y=calYear;if(m>11){m=0;y++;}setCalMonth(m);setCalYear(y);}} style={s.calNav}>›</button>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:3,marginBottom:4}}>
+        {DAYS_TR.map(d=><div key={d} style={{textAlign:"center",fontSize:11,color:"#a07050",fontWeight:700,padding:"3px 0",fontFamily:"monospace"}}>{d}</div>)}
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:3}}>
+        {cells.map((d,i)=>{
+          if(!d) return <div key={`e${i}`}/>;
+          const ds = dayStr(calYear,calMonth,d);
+          const hasIssue    = issueDates.includes(ds);
+          const hasDeadline = deadlineDates.includes(ds);
+          const hasWarning  = ds===todayStr() && stockWarnings.length>0;
+          const isTod = isToday(calYear,calMonth,d), isSel = ds===detailDay;
+
+          const show = calFilter==="all" ||
+            (calFilter==="issues"&&hasIssue) ||
+            (calFilter==="warnings"&&hasWarning) ||
+            (calFilter==="deadlines"&&hasDeadline);
+
+          return (
+            <div key={ds} onClick={()=>setDetailDay(prev=>prev===ds?null:ds)} style={{
+              ...s.calCell,
+              background:isSel?"#2d1f0e":isTod?"#fff7ed":"#fff",
+              border:isTod&&!isSel?"2px solid #f59e0b":"1px solid #f0e4cc",
+              color:isSel?"#fff":"#2d1f0e",
+              opacity:(!show&&calFilter!=="all")?0.2:1,
+            }}>
+              <div style={{fontWeight:isTod||isSel?700:400,fontSize:13}}>{d}</div>
+              <div style={{display:"flex",gap:2,marginTop:2,justifyContent:"center"}}>
+                {hasIssue    && (calFilter==="all"||calFilter==="issues")    && <div style={{width:5,height:5,borderRadius:"50%",background:isSel?"rgba(255,255,255,0.8)":"#ef4444"}}/>}
+                {hasDeadline && (calFilter==="all"||calFilter==="deadlines") && <div style={{width:5,height:5,borderRadius:"50%",background:isSel?"rgba(255,255,255,0.8)":"#3b82f6"}}/>}
+                {hasWarning  && (calFilter==="all"||calFilter==="warnings")  && <div style={{width:5,height:5,borderRadius:"50%",background:isSel?"rgba(255,255,255,0.8)":"#f59e0b"}}/>}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Legend */}
+      <div style={{display:"flex",gap:12,justifyContent:"center",fontSize:11,color:"#a07050",fontFamily:"monospace",margin:"10px 0 14px"}}>
+        <span>🔴 hata</span><span>🔵 deadline</span><span>🟡 stok uyarısı</span>
+      </div>
+
+      {/* Detail panel */}
+      {detailDay && (
+        <div style={{background:"#f9f5ef",borderRadius:12,padding:16,border:"1px solid #f0e4cc"}}>
+          <div style={{fontWeight:700,fontSize:14,color:"#2d1f0e",marginBottom:12}}>{fmtDate(detailDay)}</div>
+
+          {detailIssues.length===0 && detailDeadlines.length===0 && detailWarnings.length===0 && (
+            <div style={{color:"#c0a080",fontSize:13,fontStyle:"italic"}}>Bu gün için kayıt yok.</div>
+          )}
+
+          {detailIssues.length > 0 && (
+            <div style={{marginBottom:12}}>
+              <div style={{fontSize:12,fontWeight:700,color:"#ef4444",marginBottom:6}}>⚠️ Hatalar</div>
+              {detailIssues.map(([tid,issue]) => {
+                const task = tasks.find(t=>t.id===tid);
+                return (
+                  <div key={tid} style={{fontSize:12,color:"#ef4444",background:"#fef2f2",border:"1px solid #fecaca",borderRadius:6,padding:"6px 10px",marginBottom:4}}>
+                    <strong>{task?.name||"?"}</strong>: {issue.reason}
+                    <span style={{color:"#fca5a5",marginLeft:4}}>— {issue.by}</span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {detailDeadlines.length > 0 && (
+            <div style={{marginBottom:12}}>
+              <div style={{fontSize:12,fontWeight:700,color:"#3b82f6",marginBottom:6}}>⏳ Deadlineler</div>
+              {detailDeadlines.map(t=>(
+                <div key={t.id} style={{fontSize:13,color:"#2d1f0e",padding:"6px 10px",background:"#eff6ff",borderRadius:6,marginBottom:4,border:"1px solid #93c5fd",display:"flex",justifyContent:"space-between"}}>
+                  <span>{t.name}</span>
+                  {checked[t.id] && <span style={{color:"#22c55e",fontSize:11}}>✓ tamamlandı</span>}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {detailWarnings.length > 0 && (
+            <div>
+              <div style={{fontSize:12,fontWeight:700,color:"#f59e0b",marginBottom:6}}>🔔 Stok Uyarıları</div>
+              {detailWarnings.map((w,i)=>(
+                <div key={i} style={{padding:"8px 12px",borderRadius:8,border:"1.5px solid",marginBottom:6,fontSize:12,background:w.isBahce?"#fff7ed":"#fef2f2",borderColor:w.isBahce?"#fed7aa":"#fecaca",color:w.isBahce?"#92400e":"#991b1b"}}>
+                  <div style={{fontWeight:700}}>{w.isBahce?"🌿 Bahçe Deposu":"🏢 Merkez Depo"}</div>
+                  <div>{w.productName} — {w.pkgLabel}: <strong>{w.current}</strong> kaldı</div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────
+//  MAIN APP
+// ─────────────────────────────────────────────
 export default function App() {
-  const [fbReady, setFbReady] = useState(false);
-  const [screen, setScreen]   = useState("lobby"); // lobby | app
-  const [tab, setTab]         = useState("tasks"); // tasks | stock | calendar
-  const [roomCode, setRoomCode] = useState("");
-  const [myName, setMyName]     = useState("");
+  const [fbReady, setFbReady]     = useState(false);
+  const [screen, setScreen]       = useState("lobby");
+  const [tab, setTab]             = useState("tasks");
+  const [roomCode, setRoomCode]   = useState("");
+  const [myName, setMyName]       = useState("");
   const [roomInput, setRoomInput] = useState("");
   const [nameInput, setNameInput] = useState("");
 
-  // ── Tasks ──
-  const [tasks, setTasks]   = useState([]);
-  const [groups, setGroups] = useState([]);
+  const [tasks, setTasks]     = useState([]);
+  const [groups, setGroups]   = useState([]);
   const [checked, setChecked] = useState({});
   const [issues, setIssues]   = useState({});
   const [note, setNote]       = useState("");
@@ -79,47 +456,28 @@ export default function App() {
   const [editingId, setEditingId]     = useState(null);
   const [editName, setEditName]       = useState("");
   const [editDeadline, setEditDeadline] = useState("");
-  const [editGroup, setEditGroup]       = useState(null);
-  const [editType, setEditType]         = useState(TYPE_ROUTINE);
+  const [editGroup, setEditGroup]     = useState(null);
+  const [editType, setEditType]       = useState(TYPE_ROUTINE);
 
-  const [issueTaskId, setIssueTaskId]     = useState(null);
-  const [issueReason, setIssueReason]     = useState("");
+  const [issueTaskId, setIssueTaskId]       = useState(null);
+  const [issueReason, setIssueReason]       = useState("");
   const [showIssueModal, setShowIssueModal] = useState(false);
 
-  const [newGroupName, setNewGroupName]       = useState("");
-  const [showGroupForm, setShowGroupForm]     = useState(false);
-  const [editingGroupId, setEditingGroupId]   = useState(null);
+  const [newGroupName, setNewGroupName]         = useState("");
+  const [showGroupForm, setShowGroupForm]       = useState(false);
+  const [editingGroupId, setEditingGroupId]     = useState(null);
   const [editingGroupName, setEditingGroupName] = useState("");
 
-  // ── Stock ──
-  // products: { id: { id, name, unit?, note } }
-  // packageTypes: { id: { id, productId, label, kg?, unit } }  e.g. {label:"15kg torba", kg:15}
-  // stock: { depotId: { packageTypeId: count } }
-  // stockAlerts: { packageTypeId: { depotId: minAmount } }
+  // Stock state
   const [products, setProducts]         = useState({});
   const [packageTypes, setPackageTypes] = useState({});
   const [stock, setStock]               = useState({});
   const [stockAlerts, setStockAlerts]   = useState({});
 
-  const [showAddProduct, setShowAddProduct]   = useState(false);
-  const [newProductName, setNewProductName]   = useState("");
-  const [newProductNote, setNewProductNote]   = useState("");
-  const [expandedProduct, setExpandedProduct] = useState(null);
-  const [showAddPkg, setShowAddPkg]           = useState(null); // productId
-  const [newPkgLabel, setNewPkgLabel]         = useState("");
-  const [newPkgKg, setNewPkgKg]               = useState("");
-  const [newPkgUnit, setNewPkgUnit]           = useState("adet");
-
-  // ── Calendar ──
-  const today = new Date();
-  const [calYear, setCalYear]   = useState(today.getFullYear());
-  const [calMonth, setCalMonth] = useState(today.getMonth());
-  const [calFilter, setCalFilter] = useState("all"); // all | issues | warnings | deadlines
-
   const listenersRef = useRef([]);
 
   useEffect(() => {
-    loadFirebase().then(() => setFbReady(true)).catch(console.error);
+    loadFirebase().then(()=>setFbReady(true)).catch(console.error);
     const r = localStorage.getItem("cl-room");
     const n = localStorage.getItem("cl-name");
     if (r && n) { setRoomCode(r); setMyName(n); }
@@ -132,33 +490,32 @@ export default function App() {
   }, [fbReady, roomCode, myName, selectedDate]);
 
   const detachListeners = () => {
-    listenersRef.current.forEach(({ref,fn}) => ref.off("value",fn));
+    listenersRef.current.forEach(({ref,fn})=>ref.off("value",fn));
     listenersRef.current = [];
   };
 
   const attachListeners = (room, name, date) => {
     detachListeners();
     const db = getDB();
-    const reg = (ref, fn) => { ref.on("value", fn); listenersRef.current.push({ref,fn}); };
+    const reg = (ref,fn) => { ref.on("value",fn); listenersRef.current.push({ref,fn}); };
 
-    reg(db.ref(`rooms/${room}/groups`),         snap => setGroups(snap.val() ? Object.values(snap.val()).sort((a,b)=>(a.order||0)-(b.order||0)) : []));
-    reg(db.ref(`rooms/${room}/alltasks`),        snap => setTasks(snap.val() ? Object.values(snap.val()).sort((a,b)=>(a.order||0)-(b.order||0)) : []));
-    reg(db.ref(`rooms/${room}/notes/${date}`),   snap => setNote(snap.val() || ""));
-    reg(db.ref(`rooms/${room}/done/${date}/${name}`), snap => setChecked(snap.val() || {}));
-    reg(db.ref(`rooms/${room}/issues`),          snap => setIssues(snap.val() || {}));
-    reg(db.ref(`rooms/${room}/products`),        snap => setProducts(snap.val() || {}));
-    reg(db.ref(`rooms/${room}/packageTypes`),    snap => setPackageTypes(snap.val() || {}));
-    reg(db.ref(`rooms/${room}/stock`),           snap => setStock(snap.val() || {}));
-    reg(db.ref(`rooms/${room}/stockAlerts`),     snap => setStockAlerts(snap.val() || {}));
+    reg(db.ref(`rooms/${room}/groups`),      snap=>setGroups(snap.val()?Object.values(snap.val()).sort((a,b)=>(a.order||0)-(b.order||0)):[]));
+    reg(db.ref(`rooms/${room}/alltasks`),    snap=>setTasks(snap.val()?Object.values(snap.val()).sort((a,b)=>(a.order||0)-(b.order||0)):[]));
+    reg(db.ref(`rooms/${room}/notes/${date}`), snap=>setNote(snap.val()||""));
+    reg(db.ref(`rooms/${room}/done/${date}/${name}`), snap=>setChecked(snap.val()||{}));
+    reg(db.ref(`rooms/${room}/issues`),      snap=>setIssues(snap.val()||{}));
+    reg(db.ref(`rooms/${room}/products`),    snap=>setProducts(snap.val()||{}));
+    reg(db.ref(`rooms/${room}/packageTypes`),snap=>setPackageTypes(snap.val()||{}));
+    reg(db.ref(`rooms/${room}/stock`),       snap=>setStock(snap.val()||{}));
+    reg(db.ref(`rooms/${room}/stockAlerts`), snap=>setStockAlerts(snap.val()||{}));
 
     setScreen("app");
   };
 
   const joinRoom = (code, name) => {
-    const c = code.trim().toUpperCase(), n = name.trim();
-    if (!c || !n) return;
-    localStorage.setItem("cl-room", c);
-    localStorage.setItem("cl-name", n);
+    const c=code.trim().toUpperCase(), n=name.trim();
+    if(!c||!n) return;
+    localStorage.setItem("cl-room",c); localStorage.setItem("cl-name",n);
     setRoomCode(c); setMyName(n);
   };
 
@@ -171,11 +528,30 @@ export default function App() {
   const rp = () => `rooms/${roomCode}`;
   const db = () => getDB();
 
-  // ── Task helpers ──
+  // ── Compute stock warnings ──
+  const stockWarnings = [];
+  Object.values(packageTypes).forEach(pkg => {
+    DEPOTS.forEach(depot => {
+      const current  = stock[depot.id]?.[pkg.id] ?? 0;
+      const minAmt   = stockAlerts[pkg.id]?.[depot.id];
+      if (minAmt !== undefined && current <= minAmt) {
+        const product = products[pkg.productId];
+        stockWarnings.push({
+          pkgId: pkg.id, depotId: depot.id, productId: pkg.productId,
+          productName: product?.name || "?",
+          pkgLabel: pkg.label, unit: pkg.unit || "adet",
+          isBahce: depot.id === "bahce",
+          current, min: minAmt,
+        });
+      }
+    });
+  });
+
+  // ── Visible tasks ──
   const visibleTasks = tasks.filter(t => {
-    if (t.type === TYPE_ROUTINE) return true;
-    if (t.type === TYPE_ONETIME) return t.date === selectedDate;
-    if (t.type === TYPE_TIMED) {
+    if (t.type===TYPE_ROUTINE) return true;
+    if (t.type===TYPE_ONETIME) return t.date===selectedDate;
+    if (t.type===TYPE_TIMED) {
       if (!t.deadline) return true;
       return t.deadline >= selectedDate || !checked[t.id];
     }
@@ -183,16 +559,10 @@ export default function App() {
   });
 
   const addTask = async () => {
-    const name = newName.trim(); if (!name) return;
-    const id = `t-${Date.now()}`;
-    const gt = tasks.filter(t=>(t.groupId||null)===(newGroup||null)&&t.type===activeType);
-    await db().ref(`${rp()}/alltasks/${id}`).set({
-      id, name, by: myName, type: activeType,
-      groupId: newGroup||null, order: gt.length,
-      date: activeType===TYPE_ONETIME ? selectedDate : null,
-      deadline: activeType===TYPE_TIMED ? (newDeadline||null) : null,
-      createdAt: Date.now(),
-    });
+    const name=newName.trim(); if(!name) return;
+    const id=`t-${Date.now()}`;
+    const gt=tasks.filter(t=>(t.groupId||null)===(newGroup||null)&&t.type===activeType);
+    await db().ref(`${rp()}/alltasks/${id}`).set({id,name,by:myName,type:activeType,groupId:newGroup||null,order:gt.length,date:activeType===TYPE_ONETIME?selectedDate:null,deadline:activeType===TYPE_TIMED?(newDeadline||null):null,createdAt:Date.now()});
     setNewName(""); setNewDeadline("");
   };
 
@@ -202,148 +572,40 @@ export default function App() {
     await db().ref(`${rp()}/issues/${id}`).remove();
   };
 
-  const toggleCheck = async (id) => {
-    await db().ref(`${rp()}/done/${selectedDate}/${myName}/${id}`).set(!checked[id]);
-  };
+  const toggleCheck = async (id) => { await db().ref(`${rp()}/done/${selectedDate}/${myName}/${id}`).set(!checked[id]); };
 
   const startEdit = (task) => { setEditingId(task.id); setEditName(task.name); setEditDeadline(task.deadline||""); setEditGroup(task.groupId||null); setEditType(task.type||TYPE_ROUTINE); };
-  const saveEdit = async () => {
-    if (!editName.trim()) { setEditingId(null); return; }
-    await db().ref(`${rp()}/alltasks/${editingId}`).update({ name:editName.trim(), type:editType, groupId:editGroup||null, deadline:editType===TYPE_TIMED?(editDeadline||null):null, date:editType===TYPE_ONETIME?selectedDate:null });
+  const saveEdit  = async () => {
+    if(!editName.trim()){setEditingId(null);return;}
+    await db().ref(`${rp()}/alltasks/${editingId}`).update({name:editName.trim(),type:editType,groupId:editGroup||null,deadline:editType===TYPE_TIMED?(editDeadline||null):null,date:editType===TYPE_ONETIME?selectedDate:null});
     setEditingId(null);
   };
 
-  const moveTask = async (taskId, groupId, type, index, dir) => {
-    const gt = visibleTasks.filter(t=>(t.groupId||null)===(groupId||null)&&t.type===type);
-    const ni = index+dir; if (ni<0||ni>=gt.length) return;
+  const moveTask = async (taskId,groupId,type,index,dir) => {
+    const gt=visibleTasks.filter(t=>(t.groupId||null)===(groupId||null)&&t.type===type);
+    const ni=index+dir; if(ni<0||ni>=gt.length) return;
     const u=[...gt]; [u[index],u[ni]]=[u[ni],u[index]];
     const batch={}; u.forEach((t,i)=>{batch[`${rp()}/alltasks/${t.id}/order`]=i;});
     await db().ref().update(batch);
   };
 
-  // ── Group helpers ──
-  const addGroup = async () => {
-    const name=newGroupName.trim(); if(!name) return;
-    const id=`g-${Date.now()}`;
-    await db().ref(`${rp()}/groups/${id}`).set({id,name,color:GROUP_COLORS[groups.length%GROUP_COLORS.length],order:groups.length});
-    setNewGroupName(""); setShowGroupForm(false);
-  };
-  const deleteGroup = async (gid) => {
-    await db().ref(`${rp()}/groups/${gid}`).remove();
-    const batch={}; tasks.filter(t=>t.groupId===gid).forEach(t=>{batch[`${rp()}/alltasks/${t.id}/groupId`]=null;});
-    if(Object.keys(batch).length) await db().ref().update(batch);
-  };
-  const saveGroupEdit = async (gid) => {
-    if(!editingGroupName.trim()){setEditingGroupId(null);return;}
-    await db().ref(`${rp()}/groups/${gid}`).update({name:editingGroupName.trim()});
-    setEditingGroupId(null);
-  };
-  const moveGroup = async (index,dir) => {
-    const ni=index+dir; if(ni<0||ni>=groups.length) return;
-    const u=[...groups]; [u[index],u[ni]]=[u[ni],u[index]];
-    const batch={}; u.forEach((g,i)=>{batch[`${rp()}/groups/${g.id}/order`]=i;});
-    await db().ref().update(batch);
-  };
+  const addGroup    = async () => { const name=newGroupName.trim(); if(!name) return; const id=`g-${Date.now()}`; await db().ref(`${rp()}/groups/${id}`).set({id,name,color:GROUP_COLORS[groups.length%GROUP_COLORS.length],order:groups.length}); setNewGroupName(""); setShowGroupForm(false); };
+  const deleteGroup = async (gid) => { await db().ref(`${rp()}/groups/${gid}`).remove(); const batch={}; tasks.filter(t=>t.groupId===gid).forEach(t=>{batch[`${rp()}/alltasks/${t.id}/groupId`]=null;}); if(Object.keys(batch).length) await db().ref().update(batch); };
+  const saveGroupEdit = async (gid) => { if(!editingGroupName.trim()){setEditingGroupId(null);return;} await db().ref(`${rp()}/groups/${gid}`).update({name:editingGroupName.trim()}); setEditingGroupId(null); };
+  const moveGroup   = async (index,dir) => { const ni=index+dir; if(ni<0||ni>=groups.length) return; const u=[...groups]; [u[index],u[ni]]=[u[ni],u[index]]; const batch={}; u.forEach((g,i)=>{batch[`${rp()}/groups/${g.id}/order`]=i;}); await db().ref().update(batch); };
 
-  // ── Issue helpers ──
   const openIssueModal = (taskId) => { setIssueTaskId(taskId); setIssueReason(issues[taskId]?.reason||""); setShowIssueModal(true); };
-  const submitIssue = async () => {
-    if (!issueTaskId) return;
-    if (!issueReason.trim()) { await db().ref(`${rp()}/issues/${issueTaskId}`).remove(); }
-    else { await db().ref(`${rp()}/issues/${issueTaskId}`).set({ reason:issueReason.trim(), by:myName, reportedAt:selectedDate }); }
+  const submitIssue    = async () => {
+    if(!issueTaskId) return;
+    if(!issueReason.trim()) await db().ref(`${rp()}/issues/${issueTaskId}`).remove();
+    else await db().ref(`${rp()}/issues/${issueTaskId}`).set({reason:issueReason.trim(),by:myName,reportedAt:selectedDate});
     setShowIssueModal(false); setIssueReason(""); setIssueTaskId(null);
   };
-  const cancelIssue = async (taskId) => {
-    await db().ref(`${rp()}/issues/${taskId}`).remove();
-    setShowIssueModal(false); setIssueReason(""); setIssueTaskId(null);
-  };
+  const cancelIssue = async (taskId) => { await db().ref(`${rp()}/issues/${taskId}`).remove(); setShowIssueModal(false); setIssueReason(""); setIssueTaskId(null); };
 
   const saveNote = async (v) => { setSaving(true); await db().ref(`${rp()}/notes/${selectedDate}`).set(v); setTimeout(()=>setSaving(false),700); };
   const copyCode = () => { navigator.clipboard.writeText(roomCode).catch(()=>{}); setCopyMsg(true); setTimeout(()=>setCopyMsg(false),1500); };
   const toggleCollapse = (gid) => setCollapsedGroups(p=>({...p,[gid]:!p[gid]}));
-
-  // ── Stock helpers ──
-  const addProduct = async () => {
-    const name=newProductName.trim(); if(!name) return;
-    const id=`p-${Date.now()}`;
-    await db().ref(`${rp()}/products/${id}`).set({id,name,note:newProductNote.trim()||null,createdAt:Date.now()});
-    setNewProductName(""); setNewProductNote(""); setShowAddProduct(false);
-    setExpandedProduct(id);
-  };
-  const deleteProduct = async (pid) => {
-    await db().ref(`${rp()}/products/${pid}`).remove();
-    // remove related packageTypes and stock
-    const relPkgs = Object.values(packageTypes).filter(p=>p.productId===pid);
-    const batch={};
-    relPkgs.forEach(p=>{
-      batch[`${rp()}/packageTypes/${p.id}`]=null;
-      DEPOTS.forEach(d=>{ batch[`${rp()}/stock/${d.id}/${p.id}`]=null; batch[`${rp()}/stockAlerts/${p.id}/${d.id}`]=null; });
-    });
-    if(Object.keys(batch).length) await db().ref().update(batch);
-  };
-
-  const addPackageType = async (productId) => {
-    const label=newPkgLabel.trim(); if(!label) return;
-    const id=`pk-${Date.now()}`;
-    await db().ref(`${rp()}/packageTypes/${id}`).set({id,productId,label,kg:newPkgKg?parseFloat(newPkgKg):null,unit:newPkgUnit||"adet"});
-    // init stock to 0
-    const batch={};
-    DEPOTS.forEach(d=>{ batch[`${rp()}/stock/${d.id}/${id}`]=0; });
-    await db().ref().update(batch);
-    setNewPkgLabel(""); setNewPkgKg(""); setNewPkgUnit("adet"); setShowAddPkg(null);
-  };
-
-  const deletePkg = async (pkgId) => {
-    await db().ref(`${rp()}/packageTypes/${pkgId}`).remove();
-    const batch={};
-    DEPOTS.forEach(d=>{ batch[`${rp()}/stock/${d.id}/${pkgId}`]=null; batch[`${rp()}/stockAlerts/${pkgId}/${d.id}`]=null; });
-    await db().ref().update(batch);
-  };
-
-  const updateStock = async (depotId, pkgId, delta) => {
-    const current = (stock[depotId]?.[pkgId]) || 0;
-    const next = Math.max(0, current + delta);
-    await db().ref(`${rp()}/stock/${depotId}/${pkgId}`).set(next);
-  };
-
-  const setStockDirect = async (depotId, pkgId, val) => {
-    const n = parseInt(val);
-    if (isNaN(n) || n < 0) return;
-    await db().ref(`${rp()}/stock/${depotId}/${pkgId}`).set(n);
-  };
-
-  const setAlert = async (pkgId, depotId, val) => {
-    const n = parseInt(val);
-    if (isNaN(n) || n < 0) { await db().ref(`${rp()}/stockAlerts/${pkgId}/${depotId}`).remove(); return; }
-    await db().ref(`${rp()}/stockAlerts/${pkgId}/${depotId}`).set(n);
-  };
-
-  // ── Computed warnings ──
-  const stockWarnings = [];
-  Object.values(packageTypes).forEach(pkg => {
-    DEPOTS.forEach(depot => {
-      const current = stock[depot.id]?.[pkg.id] ?? 0;
-      const minAmt  = stockAlerts[pkg.id]?.[depot.id];
-      if (minAmt !== undefined && current <= minAmt) {
-        const product = products[pkg.productId];
-        stockWarnings.push({
-          pkgId: pkg.id, depotId: depot.id,
-          message: `${product?.name||"?"} — ${pkg.label} — ${depot.label}: ${current} adet kaldı`,
-          isBahce: depot.id === "bahce",
-          current, min: minAmt,
-        });
-      }
-    });
-  });
-
-  // ── Calendar data ──
-  const issueDates    = Object.values(issues).map(i=>i.reportedAt).filter(Boolean);
-  const deadlineDates = tasks.filter(t=>t.type===TYPE_TIMED&&t.deadline).map(t=>t.deadline);
-  const warningDates  = [todayStr()]; // stock warnings always today
-
-  const completedCount = visibleTasks.filter(t=>checked[t.id]).length;
-  const progress = visibleTasks.length>0?(completedCount/visibleTasks.length)*100:0;
-  const activeIssuesCount = Object.keys(issues).length;
 
   const deadlineLabel = (dl) => {
     if(!dl) return null;
@@ -354,10 +616,10 @@ export default function App() {
     return {text:`${diff}g kaldı`,color:"#6b7280"};
   };
 
-  const fmtDate=(d)=>new Date(d+"T00:00:00").toLocaleDateString("tr-TR",{weekday:"long",year:"numeric",month:"long",day:"numeric"});
-  const dayStr=(y,m,d)=>`${y}-${String(m+1).padStart(2,"0")}-${String(d).padStart(2,"0")}`;
-  const isToday=(y,m,d)=>{const t=new Date();return t.getFullYear()===y&&t.getMonth()===m&&t.getDate()===d;};
-  const getGroupColor=(gid)=>groups.find(g=>g.id===gid)?.color||"#e5e7eb";
+  const getGroupColor = (gid) => groups.find(g=>g.id===gid)?.color||"#e5e7eb";
+  const completedCount = visibleTasks.filter(t=>checked[t.id]).length;
+  const progress = visibleTasks.length>0?(completedCount/visibleTasks.length)*100:0;
+  const activeIssuesCount = Object.keys(issues).length;
 
   if(!fbReady) return (
     <div style={s.center}>
@@ -366,7 +628,7 @@ export default function App() {
     </div>
   );
 
-  // ── LOBBY ──
+  // LOBBY
   if(screen==="lobby") return (
     <div style={s.root}>
       <div style={{...s.card,maxWidth:400,textAlign:"center"}}>
@@ -384,10 +646,10 @@ export default function App() {
     </div>
   );
 
-  // ── ISSUE MODAL ──
+  // ISSUE MODAL
   const IssueModal = () => {
-    const task = tasks.find(t=>t.id===issueTaskId);
-    const existing = issues[issueTaskId];
+    const task=tasks.find(t=>t.id===issueTaskId);
+    const existing=issues[issueTaskId];
     return (
       <div style={s.overlay} onClick={()=>setShowIssueModal(false)}>
         <div style={s.modal} onClick={e=>e.stopPropagation()}>
@@ -396,16 +658,16 @@ export default function App() {
           {existing&&<div style={s.existingIssue}><div style={{fontSize:11,color:"#ef4444",fontWeight:700,marginBottom:4}}>Mevcut sorun — {existing.by}:</div><div style={{fontSize:13}}>{existing.reason}</div></div>}
           <textarea autoFocus value={issueReason} onChange={e=>setIssueReason(e.target.value)} placeholder="Sorunun nedeni... (boş = iptal)" style={{...s.noteArea,minHeight:70,marginBottom:12}}/>
           <div style={{display:"flex",gap:8}}>
-            <button onClick={submitIssue} style={{...s.btn,background:"#ef4444",flex:1}}>{issueReason.trim()?"⚠️ Bildir":"🗑️ Sorunu İptal Et"}</button>
-            {existing&&<button onClick={()=>cancelIssue(issueTaskId)} style={{...s.btn,background:"#6b7280"}}>İptal Et</button>}
-            <button onClick={()=>setShowIssueModal(false)} style={{...s.btn,background:"#e5e7eb",color:"#6b7280"}}>Kapat</button>
+            <button onClick={submitIssue} style={{...s.btn,background:"#ef4444",flex:1}}>{issueReason.trim()?"⚠️ Bildir":"🗑️ İptal Et"}</button>
+            {existing&&<button onClick={()=>cancelIssue(issueTaskId)} style={{...s.btn,background:"#6b7280"}}>Kapat</button>}
+            <button onClick={()=>setShowIssueModal(false)} style={{...s.btn,background:"#e5e7eb",color:"#6b7280"}}>İptal</button>
           </div>
         </div>
       </div>
     );
   };
 
-  // ── TASK ROW ──
+  // TASK ROW
   const TaskRow = ({task,index,groupTasks}) => {
     const isDone=checked[task.id], dl=task.type===TYPE_TIMED?deadlineLabel(task.deadline):null;
     const typeInfo=TYPE_LABELS[task.type]||TYPE_LABELS[TYPE_ROUTINE];
@@ -473,7 +735,7 @@ export default function App() {
     );
   };
 
-  // ── GROUP SECTION ──
+  // GROUP SECTION
   const GroupSection = ({group,gIndex}) => {
     const gid=group?group.id:"__none__";
     const gTasks=visibleTasks.filter(t=>(t.groupId||null)===(group?group.id:null));
@@ -482,9 +744,6 @@ export default function App() {
     const issueCount=gTasks.filter(t=>issues[t.id]).length;
     const isCollapsed=collapsedGroups[gid];
     const color=group?group.color:"#9ca3af";
-    const routineTasks=gTasks.filter(t=>t.type===TYPE_ROUTINE);
-    const timedTasks=gTasks.filter(t=>t.type===TYPE_TIMED);
-    const onetimeTasks=gTasks.filter(t=>t.type===TYPE_ONETIME);
     return (
       <div style={{marginBottom:14}}>
         <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
@@ -499,305 +758,29 @@ export default function App() {
             </span>
           )}
           <div style={{display:"flex",gap:2,alignItems:"center"}}>
-            {group&&(
-              <>
-                <button onClick={()=>moveGroup(gIndex,-1)} disabled={gIndex===0} style={{...s.orderBtn,opacity:gIndex===0?0.2:0.5,fontSize:9}}>▲</button>
-                <button onClick={()=>moveGroup(gIndex,1)} disabled={gIndex===groups.length-1} style={{...s.orderBtn,opacity:gIndex===groups.length-1?0.2:0.5,fontSize:9}}>▼</button>
-                <button onClick={()=>{setEditingGroupId(gid);setEditingGroupName(group.name);}} style={{...s.iconBtn,fontSize:11,opacity:0.5}}>✏️</button>
-                <button onClick={()=>deleteGroup(group.id)} style={{...s.iconBtn,fontSize:11,opacity:0.5}}>🗑️</button>
-              </>
-            )}
+            {group&&(<>
+              <button onClick={()=>moveGroup(gIndex,-1)} disabled={gIndex===0} style={{...s.orderBtn,opacity:gIndex===0?0.2:0.5,fontSize:9}}>▲</button>
+              <button onClick={()=>moveGroup(gIndex,1)} disabled={gIndex===groups.length-1} style={{...s.orderBtn,opacity:gIndex===groups.length-1?0.2:0.5,fontSize:9}}>▼</button>
+              <button onClick={()=>{setEditingGroupId(gid);setEditingGroupName(group.name);}} style={{...s.iconBtn,fontSize:11,opacity:0.5}}>✏️</button>
+              <button onClick={()=>deleteGroup(group.id)} style={{...s.iconBtn,fontSize:11,opacity:0.5}}>🗑️</button>
+            </>)}
             <button onClick={()=>toggleCollapse(gid)} style={{...s.iconBtn,fontSize:12,opacity:0.5}}>{isCollapsed?"▶":"▼"}</button>
           </div>
         </div>
         {!isCollapsed&&(
           <div style={{paddingLeft:12}}>
             {gTasks.length===0&&<div style={{color:"#c0a080",fontSize:12,fontStyle:"italic",padding:"4px 0"}}>Henüz görev yok</div>}
-            {routineTasks.map((t,i)=><TaskRow key={t.id} task={t} index={i} groupTasks={routineTasks}/>)}
-            {timedTasks.map((t,i)=><TaskRow key={t.id} task={t} index={i} groupTasks={timedTasks}/>)}
-            {onetimeTasks.map((t,i)=><TaskRow key={t.id} task={t} index={i} groupTasks={onetimeTasks}/>)}
+            {gTasks.filter(t=>t.type===TYPE_ROUTINE).map((t,i,arr)=><TaskRow key={t.id} task={t} index={i} groupTasks={arr}/>)}
+            {gTasks.filter(t=>t.type===TYPE_TIMED).map((t,i,arr)=><TaskRow key={t.id} task={t} index={i} groupTasks={arr}/>)}
+            {gTasks.filter(t=>t.type===TYPE_ONETIME).map((t,i,arr)=><TaskRow key={t.id} task={t} index={i} groupTasks={arr}/>)}
           </div>
         )}
       </div>
     );
   };
 
-  // ── STOCK TAB ──
-  const StockTab = () => {
-    const productList = Object.values(products).sort((a,b)=>a.createdAt-b.createdAt);
-    return (
-      <div>
-        {/* Warnings banner */}
-        {stockWarnings.length>0&&(
-          <div style={{marginBottom:16}}>
-            {stockWarnings.map((w,i)=>(
-              <div key={i} style={{...s.warnBanner,background:w.isBahce?"#fff7ed":"#fef2f2",borderColor:w.isBahce?"#fed7aa":"#fecaca",color:w.isBahce?"#92400e":"#991b1b"}}>
-                {w.isBahce?"🌿 Bahçe deposu azaldı — Merkez'den getir:":"🏢 Merkez depo azaldı — Temin et:"} <strong>{w.message}</strong>
-              </div>
-            ))}
-          </div>
-        )}
-
-        {/* Product list */}
-        {productList.map(product=>{
-          const pkgs = Object.values(packageTypes).filter(p=>p.productId===product.id);
-          const isExpanded = expandedProduct===product.id;
-          return (
-            <div key={product.id} style={s.productCard}>
-              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",cursor:"pointer"}} onClick={()=>setExpandedProduct(isExpanded?null:product.id)}>
-                <div>
-                  <span style={{fontWeight:700,fontSize:15,color:"#2d1f0e"}}>📦 {product.name}</span>
-                  {product.note&&<span style={{fontSize:11,color:"#a07050",marginLeft:8}}>{product.note}</span>}
-                </div>
-                <div style={{display:"flex",gap:6,alignItems:"center"}}>
-                  <button onClick={e=>{e.stopPropagation();deleteProduct(product.id);}} style={{...s.iconBtn,opacity:0.4,fontSize:12}}>🗑️</button>
-                  <span style={{color:"#a07050",fontSize:13}}>{isExpanded?"▼":"▶"}</span>
-                </div>
-              </div>
-
-              {isExpanded&&(
-                <div style={{marginTop:12}}>
-                  {/* Package types table */}
-                  {pkgs.length>0&&(
-                    <div style={{overflowX:"auto",marginBottom:12}}>
-                      <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
-                        <thead>
-                          <tr style={{background:"#f9f5ef"}}>
-                            <th style={s.th}>Paket</th>
-                            {DEPOTS.map(d=>(
-                              <th key={d.id} style={s.th}>{d.icon} {d.label}</th>
-                            ))}
-                            <th style={s.th}>Uyarı Eşiği</th>
-                            <th style={s.th}></th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {pkgs.map(pkg=>{
-                            return (
-                              <tr key={pkg.id} style={{borderBottom:"1px solid #f0e4cc"}}>
-                                <td style={{...s.td,fontWeight:600}}>
-                                  {pkg.label}
-                                  {pkg.kg&&<span style={{fontSize:10,color:"#a07050",marginLeft:4}}>{pkg.kg}kg</span>}
-                                </td>
-                                {DEPOTS.map(depot=>{
-                                  const cnt=(stock[depot.id]?.[pkg.id])||0;
-                                  const minAmt=stockAlerts[pkg.id]?.[depot.id];
-                                  const isLow=minAmt!==undefined&&cnt<=minAmt;
-                                  return (
-                                    <td key={depot.id} style={{...s.td,textAlign:"center"}}>
-                                      <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:4}}>
-                                        <button onClick={()=>updateStock(depot.id,pkg.id,-1)} style={s.stockBtn}>−</button>
-                                        <input
-                                          type="number" min="0"
-                                          value={cnt}
-                                          onChange={e=>setStockDirect(depot.id,pkg.id,e.target.value)}
-                                          style={{...s.stockInput,borderColor:isLow?"#ef4444":"#f0e4cc",color:isLow?"#ef4444":"#2d1f0e",fontWeight:isLow?700:400}}
-                                        />
-                                        <button onClick={()=>updateStock(depot.id,pkg.id,1)} style={s.stockBtn}>+</button>
-                                      </div>
-                                    </td>
-                                  );
-                                })}
-                                <td style={{...s.td,textAlign:"center"}}>
-                                  <div style={{display:"flex",gap:4,justifyContent:"center",flexWrap:"wrap"}}>
-                                    {DEPOTS.map(depot=>(
-                                      <div key={depot.id} style={{display:"flex",alignItems:"center",gap:3}}>
-                                        <span style={{fontSize:10,color:"#a07050"}}>{depot.icon}≤</span>
-                                        <input
-                                          type="number" min="0" placeholder="—"
-                                          value={stockAlerts[pkg.id]?.[depot.id]??  ""}
-                                          onChange={e=>setAlert(pkg.id,depot.id,e.target.value)}
-                                          style={{...s.alertInput}}
-                                        />
-                                      </div>
-                                    ))}
-                                  </div>
-                                </td>
-                                <td style={s.td}>
-                                  <button onClick={()=>deletePkg(pkg.id)} style={{...s.iconBtn,opacity:0.4,fontSize:11}}>🗑️</button>
-                                </td>
-                              </tr>
-                            );
-                          })}
-                        </tbody>
-                      </table>
-                    </div>
-                  )}
-
-                  {/* Add package type */}
-                  {showAddPkg===product.id?(
-                    <div style={{background:"#f9f5ef",borderRadius:10,padding:12,marginBottom:8}}>
-                      <div style={{fontSize:12,fontWeight:600,color:"#a07050",marginBottom:8}}>Yeni Paket Tipi</div>
-                      <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:8}}>
-                        <input value={newPkgLabel} onChange={e=>setNewPkgLabel(e.target.value)} placeholder='Etiket (örn: "15kg torba")' style={{...s.input,flex:2,fontSize:13,padding:"7px 10px"}}/>
-                        <input value={newPkgKg} onChange={e=>setNewPkgKg(e.target.value)} placeholder="Kg (opsiyonel)" type="number" min="0" style={{...s.input,width:100,fontSize:13,padding:"7px 10px"}}/>
-                        <select value={newPkgUnit} onChange={e=>setNewPkgUnit(e.target.value)} style={s.select}>
-                          <option value="adet">adet</option>
-                          <option value="kutu">kutu</option>
-                          <option value="torba">torba</option>
-                          <option value="paket">paket</option>
-                          <option value="kg">kg</option>
-                        </select>
-                      </div>
-                      <div style={{display:"flex",gap:8}}>
-                        <button onClick={()=>addPackageType(product.id)} style={{...s.btn,background:"#22c55e",padding:"7px 14px",fontSize:13}}>+ Ekle</button>
-                        <button onClick={()=>setShowAddPkg(null)} style={{...s.btn,background:"#e5e7eb",color:"#6b7280",padding:"7px 14px",fontSize:13}}>İptal</button>
-                      </div>
-                    </div>
-                  ):(
-                    <button onClick={()=>setShowAddPkg(product.id)} style={{...s.btn,background:"#f0fdf4",color:"#22c55e",border:"1.5px dashed #86efac",fontSize:12,padding:"6px 14px"}}>+ Paket Tipi Ekle</button>
-                  )}
-                </div>
-              )}
-            </div>
-          );
-        })}
-
-        {/* Add product */}
-        {showAddProduct?(
-          <div style={{...s.productCard,background:"#f9f5ef"}}>
-            <div style={{fontSize:13,fontWeight:600,color:"#a07050",marginBottom:8}}>Yeni Ürün</div>
-            <input value={newProductName} onChange={e=>setNewProductName(e.target.value)} placeholder="Ürün adı (örn: Kuru Mama)" style={{...s.input,marginBottom:8,fontSize:14}} onKeyDown={e=>e.key==="Enter"&&addProduct()}/>
-            <input value={newProductNote} onChange={e=>setNewProductNote(e.target.value)} placeholder="Not (opsiyonel)" style={{...s.input,marginBottom:10,fontSize:13}}/>
-            <div style={{display:"flex",gap:8}}>
-              <button onClick={addProduct} style={{...s.btn,background:"#22c55e"}}>+ Ekle</button>
-              <button onClick={()=>setShowAddProduct(false)} style={{...s.btn,background:"#e5e7eb",color:"#6b7280"}}>İptal</button>
-            </div>
-          </div>
-        ):(
-          <button onClick={()=>setShowAddProduct(true)} style={{...s.btn,background:"#f0fdf4",color:"#22c55e",border:"1.5px dashed #86efac",width:"100%",marginTop:8}}>+ Yeni Ürün Ekle</button>
-        )}
-      </div>
-    );
-  };
-
-  // ── CALENDAR TAB ──
-  const CalendarTab = () => {
-    const dim=getDaysInMonth(calYear,calMonth), fd=getFirstDayOfMonth(calYear,calMonth);
-    const cells=[...Array(fd).fill(null),...Array.from({length:dim},(_,i)=>i+1)];
-
-    // Selected day detail
-    const [detailDay, setDetailDay] = useState(null);
-    const detailIssues    = detailDay ? Object.entries(issues).filter(([,v])=>v.reportedAt===detailDay) : [];
-    const detailDeadlines = detailDay ? tasks.filter(t=>t.deadline===detailDay&&t.type===TYPE_TIMED) : [];
-    const detailWarnings  = detailDay===todayStr() ? stockWarnings : [];
-
-    const showDay = (ds) => { setDetailDay(prev=>prev===ds?null:ds); };
-
-    return (
-      <div>
-        {/* Filter chips */}
-        <div style={{display:"flex",gap:6,marginBottom:14,flexWrap:"wrap"}}>
-          {[
-            {key:"all",      label:"Tümü",      color:"#6b7280"},
-            {key:"issues",   label:"⚠️ Hatalar",  color:"#ef4444"},
-            {key:"warnings", label:"🔔 Uyarılar", color:"#f59e0b"},
-            {key:"deadlines",label:"⏳ Deadlineler",color:"#3b82f6"},
-          ].map(f=>(
-            <button key={f.key} onClick={()=>setCalFilter(f.key)} style={{
-              padding:"5px 12px",borderRadius:20,border:"1.5px solid",fontSize:12,cursor:"pointer",fontFamily:"inherit",fontWeight:calFilter===f.key?700:400,
-              background:calFilter===f.key?"#2d1f0e":"#fff",
-              borderColor:calFilter===f.key?"#2d1f0e":f.color,
-              color:calFilter===f.key?"#fff":f.color,
-            }}>{f.label}</button>
-          ))}
-        </div>
-
-        {/* Month nav */}
-        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14}}>
-          <button onClick={()=>{let m=calMonth-1,y=calYear;if(m<0){m=11;y--;}setCalMonth(m);setCalYear(y);}} style={s.calNav}>‹</button>
-          <span style={{fontWeight:700,fontSize:16,color:"#2d1f0e"}}>{MONTHS_TR[calMonth]} {calYear}</span>
-          <button onClick={()=>{let m=calMonth+1,y=calYear;if(m>11){m=0;y++;}setCalMonth(m);setCalYear(y);}} style={s.calNav}>›</button>
-        </div>
-        <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:3,marginBottom:4}}>
-          {DAYS_TR.map(d=><div key={d} style={{textAlign:"center",fontSize:11,color:"#a07050",fontWeight:700,padding:"3px 0",fontFamily:"monospace"}}>{d}</div>)}
-        </div>
-        <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:3}}>
-          {cells.map((d,i)=>{
-            if(!d) return <div key={`e${i}`}/>;
-            const ds=dayStr(calYear,calMonth,d);
-            const hasIssue    = issueDates.includes(ds);
-            const hasDeadline = deadlineDates.includes(ds);
-            const hasWarning  = ds===todayStr()&&stockWarnings.length>0;
-            const isTod=isToday(calYear,calMonth,d), isSel=ds===detailDay;
-
-            const show = calFilter==="all" ||
-              (calFilter==="issues"&&hasIssue) ||
-              (calFilter==="warnings"&&hasWarning) ||
-              (calFilter==="deadlines"&&hasDeadline);
-
-            return (
-              <div key={ds} onClick={()=>showDay(ds)} style={{
-                ...s.calCell,
-                background:isSel?"#2d1f0e":isTod?"#fff7ed":"#fff",
-                border:isTod&&!isSel?"2px solid #f59e0b":"1px solid #f0e4cc",
-                color:isSel?"#fff":"#2d1f0e",
-                opacity:(!show&&calFilter!=="all")?0.25:1,
-              }}>
-                <div style={{fontWeight:isTod||isSel?700:400,fontSize:13}}>{d}</div>
-                <div style={{display:"flex",gap:2,marginTop:2,justifyContent:"center",flexWrap:"wrap"}}>
-                  {hasIssue&&(calFilter==="all"||calFilter==="issues")&&<div style={{width:5,height:5,borderRadius:"50%",background:isSel?"rgba(255,255,255,0.8)":"#ef4444"}}/>}
-                  {hasDeadline&&(calFilter==="all"||calFilter==="deadlines")&&<div style={{width:5,height:5,borderRadius:"50%",background:isSel?"rgba(255,255,255,0.8)":"#3b82f6"}}/>}
-                  {hasWarning&&(calFilter==="all"||calFilter==="warnings")&&<div style={{width:5,height:5,borderRadius:"50%",background:isSel?"rgba(255,255,255,0.8)":"#f59e0b"}}/>}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-
-        {/* Legend */}
-        <div style={{display:"flex",gap:12,justifyContent:"center",fontSize:11,color:"#a07050",fontFamily:"monospace",margin:"10px 0 16px"}}>
-          <span>🔴 hata</span><span>🔵 deadline</span><span>🟡 stok uyarısı</span>
-        </div>
-
-        {/* Detail panel */}
-        {detailDay&&(
-          <div style={{background:"#f9f5ef",borderRadius:12,padding:16,border:"1px solid #f0e4cc"}}>
-            <div style={{fontWeight:700,fontSize:14,color:"#2d1f0e",marginBottom:10}}>{fmtDate(detailDay)}</div>
-
-            {detailIssues.length===0&&detailDeadlines.length===0&&detailWarnings.length===0&&(
-              <div style={{color:"#c0a080",fontSize:13,fontStyle:"italic"}}>Bu gün için kayıt yok.</div>
-            )}
-
-            {detailIssues.length>0&&(
-              <div style={{marginBottom:10}}>
-                <div style={{fontSize:12,fontWeight:700,color:"#ef4444",marginBottom:6}}>⚠️ Hatalar</div>
-                {detailIssues.map(([tid,issue])=>{
-                  const task=tasks.find(t=>t.id===tid);
-                  return <div key={tid} style={{...s.issueTag,marginBottom:4}}><strong>{task?.name||"?"}</strong>: {issue.reason} <span style={{color:"#fca5a5"}}>— {issue.by}</span></div>;
-                })}
-              </div>
-            )}
-
-            {detailDeadlines.length>0&&(
-              <div style={{marginBottom:10}}>
-                <div style={{fontSize:12,fontWeight:700,color:"#3b82f6",marginBottom:6}}>⏳ Deadlineler</div>
-                {detailDeadlines.map(t=>(
-                  <div key={t.id} style={{fontSize:13,color:"#2d1f0e",padding:"4px 8px",background:"#eff6ff",borderRadius:6,marginBottom:4,border:"1px solid #93c5fd"}}>
-                    {t.name} {checked[t.id]&&<span style={{color:"#22c55e",fontSize:11}}>✓ tamamlandı</span>}
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {detailWarnings.length>0&&(
-              <div>
-                <div style={{fontSize:12,fontWeight:700,color:"#f59e0b",marginBottom:6}}>🔔 Stok Uyarıları</div>
-                {detailWarnings.map((w,i)=>(
-                  <div key={i} style={{...s.warnBanner,marginBottom:4}}>{w.isBahce?"🌿":"🏢"} {w.message}</div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-      </div>
-    );
-  };
-
-  // ── TASKS TAB ──
   const ungroupedVisible = visibleTasks.filter(t=>!t.groupId);
 
-  // ── APP ──
   return (
     <div style={s.root}>
       {showIssueModal&&<IssueModal/>}
@@ -808,7 +791,7 @@ export default function App() {
             <span style={{fontSize:20}}>🌿</span>
             <span style={{fontWeight:700,fontSize:16,color:"#2d1f0e"}}>Bahçe Asistanı</span>
           </div>
-          <div style={{display:"flex",gap:6,alignItems:"center"}}>
+          <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap",justifyContent:"flex-end"}}>
             {activeIssuesCount>0&&<span style={s.issuePill}>⚠️ {activeIssuesCount}</span>}
             {stockWarnings.length>0&&<span style={s.warnPill}>🔔 {stockWarnings.length}</span>}
             <div style={s.roomPill} onClick={copyCode}>🏠 {roomCode} {copyMsg?"✓":"⎘"}</div>
@@ -819,39 +802,25 @@ export default function App() {
 
         {/* Main tabs */}
         <div style={{display:"flex",gap:6,marginBottom:16}}>
-          {[
-            {key:"tasks",    label:"📋 Görevler"},
-            {key:"stock",    label:"📦 Stok"},
-            {key:"calendar", label:"📅 Takvim"},
-          ].map(t=>(
-            <button key={t.key} onClick={()=>setTab(t.key)} style={{
-              ...s.mainTab,
-              background:tab===t.key?"#2d1f0e":"#f9f5ef",
-              color:tab===t.key?"#fff":"#a07050",
-              borderColor:tab===t.key?"#2d1f0e":"#f0e4cc",
-            }}>{t.label}</button>
+          {[{key:"tasks",label:"📋 Görevler"},{key:"stock",label:"📦 Stok"},{key:"calendar",label:"📅 Takvim"}].map(t=>(
+            <button key={t.key} onClick={()=>setTab(t.key)} style={{...s.mainTab,background:tab===t.key?"#2d1f0e":"#f9f5ef",color:tab===t.key?"#fff":"#a07050",borderColor:tab===t.key?"#2d1f0e":"#f0e4cc"}}>{t.label}</button>
           ))}
         </div>
 
-        {/* ── TASKS ── */}
+        {/* TASKS */}
         {tab==="tasks"&&(
           <>
-            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}>
-              <div style={s.dateLabel}>{fmtDate(selectedDate)}</div>
-            </div>
-
+            <div style={{...s.dateLabel,marginBottom:12}}>{fmtDate(selectedDate)}</div>
             {visibleTasks.length>0&&(
               <div style={{...s.progressWrap,marginBottom:16}}>
                 <div style={s.progressTrack}><div style={{...s.progressFill,width:`${progress}%`}}/></div>
                 <span style={s.progressText}>{completedCount}/{visibleTasks.length}</span>
               </div>
             )}
-
             <div style={{marginBottom:8}}>
               {ungroupedVisible.length>0&&<GroupSection group={null} gIndex={-1}/>}
               {groups.map((g,i)=><GroupSection key={g.id} group={g} gIndex={i}/>)}
             </div>
-
             {showGroupForm?(
               <div style={{display:"flex",gap:8,marginBottom:14}}>
                 <input autoFocus value={newGroupName} onChange={e=>setNewGroupName(e.target.value)} onKeyDown={e=>e.key==="Enter"&&addGroup()} placeholder="Grup adı..." style={{...s.input,flex:1}}/>
@@ -861,7 +830,6 @@ export default function App() {
             ):(
               <button onClick={()=>setShowGroupForm(true)} style={{...s.btn,background:"#f3e8ff",color:"#a855f7",border:"1.5px dashed #a855f7",width:"100%",fontSize:13,marginBottom:14}}>+ Yeni Grup Ekle</button>
             )}
-
             <div style={{display:"flex",gap:6,marginBottom:10}}>
               {Object.entries(TYPE_LABELS).map(([k,v])=>(
                 <button key={k} onClick={()=>setActiveType(k)} style={{...s.typeChip,flex:1,padding:"8px 4px",background:activeType===k?v.bg:"#f9fafb",borderColor:activeType===k?v.border:"#e5e7eb",color:activeType===k?v.color:"#6b7280",fontWeight:activeType===k?700:400,fontSize:12}}>
@@ -869,7 +837,6 @@ export default function App() {
                 </button>
               ))}
             </div>
-
             <div style={s.addRow}>
               <input value={newName} onChange={e=>setNewName(e.target.value)} onKeyDown={e=>e.key==="Enter"&&addTask()} placeholder={`${TYPE_LABELS[activeType].label} görev ekle...`} style={{...s.input,borderColor:TYPE_LABELS[activeType].border}}/>
               <button onClick={addTask} style={{...s.btn,background:TYPE_LABELS[activeType].color}}>+ Ekle</button>
@@ -880,18 +847,13 @@ export default function App() {
                 <option value="">— Grubsuz —</option>
                 {groups.map(g=><option key={g.id} value={g.id}>{g.name}</option>)}
               </select>
-              {activeType===TYPE_TIMED&&(
-                <>
-                  <span style={{fontSize:12,color:"#a07050"}}>Son tarih:</span>
-                  <input type="date" value={newDeadline} onChange={e=>setNewDeadline(e.target.value)} style={s.dateInput}/>
-                  {newDeadline&&<button onClick={()=>setNewDeadline("")} style={s.clearDate}>✕</button>}
-                </>
-              )}
+              {activeType===TYPE_TIMED&&(<>
+                <span style={{fontSize:12,color:"#a07050"}}>Son tarih:</span>
+                <input type="date" value={newDeadline} onChange={e=>setNewDeadline(e.target.value)} style={s.dateInput}/>
+                {newDeadline&&<button onClick={()=>setNewDeadline("")} style={s.clearDate}>✕</button>}
+              </>)}
             </div>
-            <div style={s.hint}>
-              {activeType===TYPE_ROUTINE?"💡 Her gün tekrar eder":activeType===TYPE_ONETIME?"💡 Yalnızca bugün görünür":"💡 Deadline'a kadar her gün görünür"}
-            </div>
-
+            <div style={s.hint}>{activeType===TYPE_ROUTINE?"💡 Her gün tekrar eder":activeType===TYPE_ONETIME?"💡 Yalnızca bugün görünür":"💡 Deadline'a kadar her gün görünür"}</div>
             <div style={s.divider}/>
             <div>
               <div style={s.noteHeader}>
@@ -903,8 +865,25 @@ export default function App() {
           </>
         )}
 
-        {tab==="stock"&&<StockTab/>}
-        {tab==="calendar"&&<CalendarTab/>}
+        {tab==="stock"&&(
+          <StockTab
+            roomCode={roomCode}
+            products={products}
+            packageTypes={packageTypes}
+            stock={stock}
+            stockAlerts={stockAlerts}
+            stockWarnings={stockWarnings}
+          />
+        )}
+
+        {tab==="calendar"&&(
+          <CalendarTab
+            tasks={tasks}
+            issues={issues}
+            checked={checked}
+            stockWarnings={stockWarnings}
+          />
+        )}
       </div>
     </div>
   );
@@ -917,7 +896,7 @@ const s = {
   spinner:{width:20,height:20,borderRadius:"50%",border:"3px solid #f0e4cc",borderTopColor:"#f59e0b"},
   title:{fontSize:22,fontWeight:700,color:"#2d1f0e"},
   dateLabel:{fontSize:11,color:"#b07040",textTransform:"uppercase",letterSpacing:"1.2px",fontFamily:"monospace"},
-  mainTab:{flex:1,padding:"9px 6px",borderRadius:10,border:"1.5px solid",fontSize:13,cursor:"pointer",fontWeight:600,fontFamily:"inherit",transition:"all 0.15s"},
+  mainTab:{flex:1,padding:"9px 6px",borderRadius:10,border:"1.5px solid",fontSize:13,cursor:"pointer",fontWeight:600,fontFamily:"inherit"},
   roomPill:{fontSize:11,background:"#fff7ed",border:"1px solid #fed7aa",color:"#ea580c",borderRadius:20,padding:"3px 9px",fontFamily:"monospace",cursor:"pointer",letterSpacing:1,fontWeight:700,userSelect:"none"},
   issuePill:{fontSize:11,background:"#fef2f2",border:"1px solid #fca5a5",color:"#ef4444",borderRadius:20,padding:"3px 9px",fontFamily:"monospace",fontWeight:700},
   warnPill:{fontSize:11,background:"#fffbeb",border:"1px solid #fcd34d",color:"#92400e",borderRadius:20,padding:"3px 9px",fontFamily:"monospace",fontWeight:700},
@@ -927,7 +906,7 @@ const s = {
   progressTrack:{flex:1,height:6,background:"#f0e4cc",borderRadius:99,overflow:"hidden"},
   progressFill:{height:"100%",background:"linear-gradient(90deg,#f59e0b,#22c55e)",borderRadius:99,transition:"width 0.4s ease"},
   progressText:{fontSize:12,color:"#a07050",fontFamily:"monospace"},
-  taskRow:{display:"flex",alignItems:"flex-start",gap:9,padding:"9px 11px",borderRadius:10,border:"1px solid #f0e4cc",marginBottom:5,transition:"background 0.2s"},
+  taskRow:{display:"flex",alignItems:"flex-start",gap:9,padding:"9px 11px",borderRadius:10,border:"1px solid #f0e4cc",marginBottom:5},
   orderBtn:{background:"none",border:"none",cursor:"pointer",fontSize:10,color:"#a07050",padding:"1px 3px",lineHeight:1,display:"block"},
   checkbox:{width:22,height:22,borderRadius:6,border:"2px solid #d1d5db",display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",flexShrink:0,transition:"all 0.15s",marginTop:1},
   taskName:{fontSize:14,color:"#2d1f0e"},
@@ -957,8 +936,7 @@ const s = {
   productCard:{background:"#fff",border:"1px solid #f0e4cc",borderRadius:12,padding:16,marginBottom:12},
   th:{padding:"8px 10px",textAlign:"left",fontWeight:600,fontSize:12,color:"#a07050",borderBottom:"1px solid #f0e4cc"},
   td:{padding:"8px 10px",verticalAlign:"middle"},
-  stockBtn:{background:"#f9f5ef",border:"1px solid #f0e4cc",borderRadius:6,cursor:"pointer",fontSize:14,width:26,height:26,display:"flex",alignItems:"center",justifyContent:"center",fontWeight:700,color:"#a07050"},
+  stockBtn:{background:"#f9f5ef",border:"1px solid #f0e4cc",borderRadius:6,cursor:"pointer",fontSize:16,width:28,height:28,display:"flex",alignItems:"center",justifyContent:"center",fontWeight:700,color:"#a07050",flexShrink:0},
   stockInput:{width:46,textAlign:"center",border:"1.5px solid",borderRadius:6,padding:"3px 4px",fontSize:13,fontFamily:"monospace",outline:"none",background:"#fff"},
-  alertInput:{width:36,textAlign:"center",border:"1px solid #f0e4cc",borderRadius:6,padding:"2px 4px",fontSize:11,fontFamily:"monospace",outline:"none",background:"#fff",color:"#a07050"},
-  warnBanner:{padding:"8px 12px",borderRadius:8,border:"1px solid",fontSize:12,lineHeight:1.5,background:"#fff7ed",borderColor:"#fed7aa",color:"#92400e"},
+  alertInput:{width:38,textAlign:"center",border:"1px solid #f0e4cc",borderRadius:6,padding:"2px 4px",fontSize:11,fontFamily:"monospace",outline:"none",background:"#fff",color:"#a07050"},
 };
