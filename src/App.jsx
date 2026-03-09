@@ -950,7 +950,7 @@ export default function App() {
     </div>
   );};
 
-  const GroupSection=({group,gIndex})=>{ const gid=group?group.id:"__none__"; const gTasks=visibleTasks.filter(t=>(t.groupId||null)===(group?group.id:null)); if(gTasks.length===0&&group) return null; const doneCount=gTasks.filter(t=>checked[t.id]).length; const issueCount=gTasks.filter(t=>issues[t.id]).length; const isCollapsed=collapsedGroups[gid]; const color=group?group.color:"#9ca3af"; return (
+  const GroupSection=({group,gIndex})=>{ const gid=group?group.id:"__none__"; const gTasks=visibleTasks.filter(t=>(t.groupId||null)===(group?group.id:null)).map(t=>({...t,type:t.type||TYPE_ROUTINE})); if(gTasks.length===0&&group) return null; const doneCount=gTasks.filter(t=>checked[t.id]).length; const issueCount=gTasks.filter(t=>issues[t.id]).length; const isCollapsed=collapsedGroups[gid]; const color=group?group.color:"#9ca3af"; return (
     <div style={{marginBottom:14}}>
       <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
         <div style={{width:4,height:20,borderRadius:2,background:color,flexShrink:0}}/>
