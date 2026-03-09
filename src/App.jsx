@@ -917,7 +917,7 @@ export default function App() {
             <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:4,alignItems:"center"}}>
               <span style={{fontSize:11,color:"#a07050"}}>Grup:</span>
               <select value={editGroup||""} onChange={e=>setEditGroup(e.target.value||null)} style={s.select}>
-                <option value="">— Grubsuz —</option>
+                <option value="">— Grupsuz —</option>
                 {groups.map(g=><option key={g.id} value={g.id}>{g.name}</option>)}
               </select>
             </div>
@@ -958,7 +958,7 @@ export default function App() {
           <input autoFocus value={editingGroupName} onChange={e=>setEditingGroupName(e.target.value)} onBlur={()=>saveGroupEdit(gid)} onKeyDown={e=>e.key==="Enter"&&saveGroupEdit(gid)} style={{...s.editInput,flex:1,fontSize:13}}/>
         ):(
           <span style={{fontWeight:700,fontSize:13,color:"#2d1f0e",flex:1,cursor:"pointer"}} onClick={()=>toggleCollapse(gid)}>
-            {group?group.name:"Grubsuz"}
+            {group?group.name:"Grupsuz"}
             <span style={{fontWeight:400,fontSize:11,color:"#a07050",marginLeft:6}}>{doneCount}/{gTasks.length}</span>
             {issueCount>0&&<span style={{fontSize:11,color:"#ef4444",marginLeft:6}}>⚠️ {issueCount}</span>}
           </span>
@@ -1038,7 +1038,7 @@ export default function App() {
           <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:6,alignItems:"center"}}>
             <span style={{fontSize:12,color:"#a07050"}}>Grup:</span>
             <select value={newGroup||""} onChange={e=>setNewGroup(e.target.value||null)} style={s.select}>
-              <option value="">— Grubsuz —</option>
+              <option value="">— Grupsuz —</option>
               {groups.map(g=><option key={g.id} value={g.id}>{g.name}</option>)}
             </select>
             {activeType===TYPE_TIMED&&(<><span style={{fontSize:12,color:"#a07050"}}>Son tarih:</span><input type="date" value={newDeadline} onChange={e=>setNewDeadline(e.target.value)} style={s.dateInput}/>{newDeadline&&<button onClick={()=>setNewDeadline("")} style={s.clearDate}>✕</button>}</>)}
