@@ -1037,7 +1037,7 @@ export default function App() {
             ))}
           </div>
           <div style={s.addRow}>
-            <input value={newName} onChange={e=>setNewName(e.target.value)} onKeyDown={e=>e.key==="Enter"&&addTask()} placeholder={`${TYPE_LABELS[activeType].label} görev ekle...`} style={{...s.input,borderColor:TYPE_LABELS[activeType].border}}/>
+            <input value={newName} onChange={e=>setNewName(e.target.value)} onKeyDown={e=>e.key==="Enter"&&addTask()} onFocus={e=>{const y=window.scrollY; requestAnimationFrame(()=>window.scrollTo({top:y,behavior:"instant"}));}} placeholder={`${TYPE_LABELS[activeType].label} görev ekle...`} style={{...s.input,borderColor:TYPE_LABELS[activeType].border}} autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck="false"/>
             <button onClick={addTask} style={{...s.btn,background:TYPE_LABELS[activeType].color}}>+ Ekle</button>
           </div>
           <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:6,alignItems:"center"}}>
@@ -1061,6 +1061,22 @@ export default function App() {
       </div>
     </div>
   );
+}
+
+// Prevent scroll jump on mobile input focus
+if (typeof window !== "undefined") {
+  document.addEventListener("focusin", () => {
+    const y = window.scrollY;
+    requestAnimationFrame(() => window.scrollTo({ top: y, behavior: "instant" }));
+  });
+}
+
+// Prevent scroll jump on mobile input focus
+if (typeof window !== "undefined") {
+  document.addEventListener("focusin", () => {
+    const y = window.scrollY;
+    requestAnimationFrame(() => window.scrollTo({ top: y, behavior: "instant" }));
+  });
 }
 
 const s = {
