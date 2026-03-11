@@ -839,7 +839,7 @@ export default function App() {
     await db().ref(`${rp()}/alltasks/${id}`).set({id,name,by:myName,type:activeType,groupId:newGroup||null,order:gt.length,date:activeType===TYPE_ONETIME?selectedDate:null,deadline:activeType===TYPE_TIMED?(newDeadline||null):null,createdAt:Date.now()});
     setNewName(""); setNewDeadline("");
   };
-  const deleteTask  = async id=>{ await db().ref(`${rp()}/alltasks/${id}`).remove(); await db().ref(`${rp()}/done/${selectedDate}/${myName}/${id}`).remove(); await db().ref(`${rp()}/issues/${id}`).remove(); };
+  const deleteTask  = async id=>{ if(!window.confirm("Bu görevi silmek istediğinizden emin misiniz?")) return; await db().ref(`${rp()}/alltasks/${id}`).remove(); await db().ref(`${rp()}/done/${selectedDate}/${myName}/${id}`).remove(); await db().ref(`${rp()}/issues/${id}`).remove(); };
   const toggleCheck = async id=>{ await db().ref(`${rp()}/done/${selectedDate}/${myName}/${id}`).set(!checked[id]); };
   const startEdit   = task=>{ setEditingId(task.id);setEditName(task.name);setEditDeadline(task.deadline||"");setEditGroup(task.groupId||null);setEditType(task.type||TYPE_ROUTINE); };
   const saveEdit    = async()=>{ if(!editName.trim()){setEditingId(null);return;} await db().ref(`${rp()}/alltasks/${editingId}`).update({name:editName.trim(),type:editType,groupId:editGroup||null,deadline:editType===TYPE_TIMED?(editDeadline||null):null,date:editType===TYPE_ONETIME?selectedDate:null}); setEditingId(null); };
@@ -977,7 +977,7 @@ export default function App() {
     </div>
   );};
 
-  const ungroupedVisible=visibleTasks.filter(t=>!t.groupId);
+  const ungroupedVisible=visibleTasks.filter(t=>!t.groupId && t.groupId !== 0);
 
   return (
     <div style={s.root}>
