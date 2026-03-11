@@ -840,7 +840,12 @@ export default function App() {
     setNewName(""); setNewDeadline("");
   };
   const deleteTask  = async id=>{ if(!window.confirm("Bu görevi silmek istediğinizden emin misiniz?")) return; await db().ref(`${rp()}/alltasks/${id}`).remove(); await db().ref(`${rp()}/done/${selectedDate}/${myName}/${id}`).remove(); await db().ref(`${rp()}/issues/${id}`).remove(); };
-  const toggleCheck = async id=>{ await db().ref(`${rp()}/done/${selectedDate}/${myName}/${id}`).set(!checked[id]); };
+  const toggleCheck = async (id, e)=>{ 
+    if(e) e.preventDefault();
+    const scrollY = window.scrollY;
+    await db().ref(`${rp()}/done/${selectedDate}/${myName}/${id}`).set(!checked[id]);
+    requestAnimationFrame(()=>window.scrollTo({top:scrollY,behavior:"instant"}));
+  };
   const startEdit   = task=>{ setEditingId(task.id);setEditName(task.name);setEditDeadline(task.deadline||"");setEditGroup(task.groupId||null);setEditType(task.type||TYPE_ROUTINE); };
   const saveEdit    = async()=>{ if(!editName.trim()){setEditingId(null);return;} await db().ref(`${rp()}/alltasks/${editingId}`).update({name:editName.trim(),type:editType,groupId:editGroup||null,deadline:editType===TYPE_TIMED?(editDeadline||null):null,date:editType===TYPE_ONETIME?selectedDate:null}); setEditingId(null); };
   const moveTask    = async(taskId,groupId,type,index,dir)=>{ const gt=visibleTasks.filter(t=>(t.groupId||null)===(groupId||null)&&t.type===type); const ni=index+dir; if(ni<0||ni>=gt.length) return; const u=[...gt]; [u[index],u[ni]]=[u[ni],u[index]]; const batch={}; u.forEach((t,i)=>{batch[`${rp()}/alltasks/${t.id}/order`]=i;}); await db().ref().update(batch); };
@@ -901,7 +906,7 @@ export default function App() {
         <button onClick={()=>moveTask(task.id,task.groupId,task.type,index,-1)} disabled={index===0} style={{...s.orderBtn,opacity:index===0?0.2:0.6}}>▲</button>
         <button onClick={()=>moveTask(task.id,task.groupId,task.type,index,1)} disabled={index===groupTasks.length-1} style={{...s.orderBtn,opacity:index===groupTasks.length-1?0.2:0.6}}>▼</button>
       </div>
-      <button onClick={()=>toggleCheck(task.id)} style={{...s.checkbox,background:isDone?"#22c55e":"transparent",borderColor:isDone?"#22c55e":"#d1d5db"}}>
+      <button onClick={e=>toggleCheck(task.id,e)} style={{...s.checkbox,background:isDone?"#22c55e":"transparent",borderColor:isDone?"#22c55e":"#d1d5db"}}>
         {isDone&&<svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M2 6l3 3 5-5" stroke="white" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"/></svg>}
       </button>
       <div style={{flex:1,minWidth:0}}>
